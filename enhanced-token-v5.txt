@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// Previous imports remain...
+
+contract EnhancedDynoTokenV5 is EnhancedDynoTokenV4 {
+    // Marketing and Referral Structures
+    struct ReferralProgram {
+        uint256 referralBonus;         // Bonus percentage for referrer
+        uint256 referredBonus;         // Bonus percentage for referred user
+        uint256 minimumPurchase;       // Minimum purchase to qualify
+        uint256 maxReferrals;          // Maximum referrals per user
+        uint256 cooldownPeriod;        // Time between referrals
+        bool isActive;
+    }
+
+    struct ReferralStats {
+        address referrer;
+        uint256 totalReferrals;
+        uint256 totalBonus;
+        uint256 activeReferrals;
+        uint256 lastReferralTime;
+    }
+
+    struct MarketingCampaign {
+        string name;
+        uint256 budget;
+        uint256 spent;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 targetReach;
+        uint256 actualReach;
+        bool isActive;
+    }
+
+    // Advanced Analytics Structures
+    struct UserMetrics {
+        uint256 firstTransaction;
+        uint256 lastTransaction;
+        uint256 totalTransactions;
+        uint256 totalVolume;
+        uint256 averageHoldTime;
+        uint256 largestTransaction;
+        bool isActive;
+    }
+
+    struct MarketMetrics {
+        uint256 priceHigh;
+        uint256 priceLow;
+        uint256 volume24h;
+        uint256 marketCap;
+        uint256 liquidity;
+        uint256 holders;
+        uint256 lastUpdate;
+    }
+
+    // State Variables
+    ReferralProgram public referralProgram;
+    mapping(address => ReferralStats) public referralStats;
+    mapping(address => address) public referredBy;
+    
+    mapping(uint256 => MarketingCampaign) public marketingCampaigns;
+    uint256 public campaignCount;
+    
+    mapping(address => UserMetrics) public userMetrics;
+    MarketMetrics public marketMetrics;
+    
+    // Advanced tracking
+    mapping(uint256 => uint256) public hourlyHolderCount;
+    mapping(uint256 => uint256) public dailyNewUsers;
+    mapping(address => uint256[]) public userTransactionHistory;
+
+    // Events
+    event ReferralProgramUpdated(uint256 referralBonus, uint256 referredBonus);
+    event ReferralProcessed(address indexed referrer, address indexed referred, uint256 bonus);
+    event CampaignCreated(uint256 indexed campaignId, string name, uint256 budget);
+    event CampaignMetricsUpdated(uint256 indexed campaignId, uint256 reach, uint256 spent);
+    event MarketMetricsUpdated(uint256 price, uint256 volume, uint256 marketCap);
+
+    constructor(address _dexRouter) EnhancedDynoTokenV4(_dexRouter) {
+        // Initialize referral program
+        referralProgram = ReferralProgram({
+            referralBonus: 5,          // 5% bonus for referrer
+            referredBonus: 2,          // 2% bonus for referred user
+            minimumPurchase: 100 * 10**18, // 100 tokens minimum
+            maxReferrals: 100,         // 100 max referrals per user
+            cooldownPeriod: 1 days,    // 1 day between referrals
+            isActive: true
+        });
+
+        // Initialize market metrics
+        marketMetrics.lastUpdate = block.timestamp;
+    }
+
+    // Referral System Functions
+    function registerReferral(address referrer) external {
+        require(referralProgram.isActive, "Referral program inactive");
+        require(referrer != msg.sender, "Cannot refer self");
+        require(referrer != address(0), "Invalid referrer");
+        require(referredBy[msg.sender] == address(0), "Already referred");
+        require(
+            referralStats[referrer].totalReferrals < referralProgram.maxReferrals,
+            "Max referrals reached"
+        );
+
+        referredBy[msg.sender] = referrer;
+        referralStats[referrer].totalReferrals++;
+        referralStats[referrer].activeReferrals++;
+        
+        emit ReferralProcessed(referrer, msg.sender, 0);
+    }
+
+    function processReferralBonus(address user, uint256 amount) internal {
+        if (!referralProgram.isActive || amount < referralProgram.minimumPurchase) {
+            return;
+        }
+
+        address referrer = referredBy[user];
+        if (referrer != address(0)) {
+            uint256 referrerBonus = (amount * referralProgram.referralBonus) / 100;
+            uint256 userBonus = (amount * referralProgram.referredBonus) / 100;
+
+            // Mint bonus tokens
+            _mint(referrer, referrerBonus);
+            _mint(user, userBonus);
+
+            // Update stats
+            referralStats[referrer].totalBonus += referrerBonus;
+            referralStats[referrer].lastReferralTime = block.timestamp;
+
+            emit ReferralProcessed(referrer, user, referrerBonus + userBonus);
+        }
+    }
+
+    // Marketing Campaign Functions
+    function createMarketingCampaign(
+        string memory name,
+        uint256 budget,
+        uint256 duration,
+        uint256 targetReach
+    ) external onlyOwner {
+        uint256 campaignId = ++campaignCount;
+        
+        marketingCampaigns[campaignId] = MarketingCampaign({
+            name: name,
+            budget: budget,
+            spent: 0,
+            startTime: block.timestamp,
+            endTime: block.timestamp + duration,
+            targetReach: targetReach,
+            actualReach: 0,
+            isActive: true
+        });
+
+        emit CampaignCreated(campaignId, name, budget);
+    }
+
+    function updateCampaignMetrics(
+        uint256 campaignId,
+        uint256 reach,
+        uint256 spent
+    ) external onlyOwner {
+        MarketingCampaign storage campaign = marketingCampaigns[campaignId];
+        require(campaign.isActive, "Campaign not active");
+        require(campaign.spent + spent <= campaign.budget, "Exceeds budget");
+
+        campaign.actualReach = reach;
+        campaign.spent += spent;
+
+        emit CampaignMetricsUpdated(campaignId, reach, spent);
+    }
+
+    // Analytics Functions
+    function updateMarketMetrics() internal {
+        MarketMetrics storage metrics = marketMetrics;
+        
+        // Update price metrics
+        (uint256 currentPrice,) = getCurrentPrice();
+        if (currentPrice > metrics.priceHigh) metrics.priceHigh = currentPrice;
+        if (currentPrice < metrics.priceLow || metrics.priceLow == 0) metrics.priceLow = currentPrice;
+
+        // Update volume and market cap
+        metrics.volume24h = calculate24hVolume();
+        metrics.marketCap = currentPrice * totalSupply();
+        metrics.liquidity = calculateLiquidity();
+        metrics.holders = calculateUniqueHolders();
+        metrics.lastUpdate = block.timestamp;
+
+        emit MarketMetricsUpdated(currentPrice, metrics.volume24h, metrics.marketCap);
+    }
+
+    function updateUserMetrics(
+        address user,
+        uint256 amount
+    ) internal {
+        UserMetrics storage metrics = userMetrics[user];
+        
+        if (!metrics.isActive) {
+            metrics.isActive = true;
+            metrics.firstTransaction = block.timestamp;
+            dailyNewUsers[block.timestamp / 1 days]++;
+        }
+
+        metrics.lastTransaction = block.timestamp;
+        metrics.totalTransactions++;
+        metrics.totalVolume += amount;
+        if (amount > metrics.largestTransaction) {
+            metrics.largestTransaction = amount;
+        }
+
+        // Update transaction history
+        userTransactionHistory[user].push(block.timestamp);
+        
+        // Calculate average hold time
+        if (userTransactionHistory[user].length > 1) {
+            uint256[] storage history = userTransactionHistory[user];
+            uint256 totalHoldTime = 0;
+            for (uint256 i = 1; i < history.length; i++) {
+                totalHoldTime += history[i] - history[i-1];
+            }
+            metrics.averageHoldTime = totalHoldTime / (history.length - 1);
+        }
+    }
+
+    // Analytics Helper Functions
+    function getCurrentPrice() internal view returns (uint256 price, uint256 timestamp) {
+        // Implementation to get current price from DEX
+        return (0, block.timestamp);
+    }
+
+    function calculate24hVolume() internal view returns (uint256) {
+        // Implementation to calculate 24h volume
+        return 0;
+    }
+
+    function calculateLiquidity() internal view returns (uint256) {
+        // Implementation to calculate total liquidity
+        return 0;
+    }
+
+    function calculateUniqueHolders() internal view returns (uint256) {
+        // Implementation to calculate unique holders
+        return 0;
+    }
+
+    // Enhanced Transfer Override
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual override {
+        // Process referral bonus if applicable
+        processReferralBonus(recipient, amount);
+
+        // Update user metrics
+        updateUserMetrics(sender, amount);
+        updateUserMetrics(recipient, amount);
+
+        // Update market metrics
+        updateMarketMetrics();
+
+        // Execute transfer using parent implementation
+        super._transfer(sender, recipient, amount);
+    }
+
+    // View Functions
+    function getCampaignAnalytics(uint256 campaignId) external view returns (
+        string memory name,
+        uint256 budget,
+        uint256 spent,
+        uint256 reach,
+        uint256 efficiency
+    ) {
+        MarketingCampaign storage campaign = marketingCampaigns[campaignId];
+        return (
+            campaign.name,
+            campaign.budget,
+            campaign.spent,
+            campaign.actualReach,
+            campaign.spent > 0 ? (campaign.actualReach * 1e18) / campaign.spent : 0
+        );
+    }
+
+    function getUserAnalytics(address user) external view returns (
+        uint256 totalVolume,
+        uint256 averageHoldTime,
+        uint256 transactionCount,
+        uint256 referralCount,
+        uint256 totalBonus
+    ) {
+        UserMetrics storage metrics = userMetrics[user];
+        ReferralStats storage refs = referralStats[user];
+        return (
+            metrics.totalVolume,
+            metrics.averageHoldTime,
+            metrics.totalTransactions,
+            refs.totalReferrals,
+            refs.totalBonus
+        );
+    }
+
+    function getMarketAnalytics() external view returns (
+        uint256 currentPrice,
+        uint256 marketCap,
+        uint256 volume24h,
+        uint256 liquidity,
+        uint256 holders
+    ) {
+        return (
+            marketMetrics.priceHigh,
+            marketMetrics.marketCap,
+            marketMetrics.volume24h,
+            marketMetrics.liquidity,
+            marketMetrics.holders
+        );
+    }
+}

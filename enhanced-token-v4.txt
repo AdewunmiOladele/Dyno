@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// Previous imports remain...
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Wrapper.sol";
+import "@openzeppelin/contracts/finance/PaymentSplitter.sol";
+
+interface IBridgeAdapter {
+    function bridgeTokens(
+        address token,
+        uint256 amount,
+        uint256 targetChain,
+        address recipient
+    ) external;
+    
+    function receiveBridgedTokens(
+        uint256 sourceChain,
+        address token,
+        address recipient,
+        uint256 amount,
+        bytes calldata proof
+    ) external;
+}
+
+interface IYieldStrategy {
+    function deposit(uint256 amount) external;
+    function withdraw(uint256 amount) external;
+    function getAPY() external view returns (uint256);
+    function getTotalValue() external view returns (uint256);
+}
+
+contract EnhancedDynoTokenV4 is EnhancedDynoTokenV3 {
+    // Treasury Management Structures
+    struct TreasuryAsset {
+        address token;
+        uint256 balance;
+        uint256 allocated;
+        uint256 lastRebalance;
+        bool isActive;
+    }
+
+    struct YieldStrategy {
+        address strategy;
+        uint256 allocatedAmount;
+        uint256 targetPercentage;
+        uint256 minAPY;
+        bool isActive;
+    }
+
+    struct TreasuryMetrics {
+        uint256 totalValue;
+        uint256 yieldGenerated;
+        uint256 lastRebalance;
+        uint256 performanceScore;
+    }
+
+    // Cross-chain Structures
+    struct ChainInfo {
+        uint256 chainId;
+        address bridgeAdapter;
+        address remoteToken;
+        bool isActive;
+    }
+
+    struct BridgeTransaction {
+        uint256 sourceChain;
+        uint256 targetChain;
+        address sender;
+        address recipient;
+        uint256 amount;
+        uint256 timestamp;
+        bool isProcessed;
+    }
+
+    // State Variables
+    mapping(address => TreasuryAsset) public treasuryAssets;
+    mapping(address => YieldStrategy) public yieldStrategies;
+    TreasuryMetrics public treasuryMetrics;
+    
+    mapping(uint256 => ChainInfo) public supportedChains;
+    mapping(bytes32 => BridgeTransaction) public bridgeTransactions;
+    uint256 public bridgeTransactionCount;
+    
+    uint256 public constant TREASURY_REBALANCE_INTERVAL = 1 days;
+    uint256 public constant MIN_BRIDGE_AMOUNT = 1000 * 10**18;
+    uint256 public constant BRIDGE_COOL_DOWN = 1 hours;
+
+    // Events
+    event TreasuryAssetAdded(address token, uint256 initialBalance);
+    event YieldStrategyUpdated(address strategy, uint256 targetPercentage);
+    event TreasuryRebalanced(uint256 totalValue, uint256 timestamp);
+    event BridgeTransactionInitiated(bytes32 indexed txHash, uint256 sourceChain, uint256 targetChain);
+    event BridgeTransactionCompleted(bytes32 indexed txHash, address recipient, uint256 amount);
+
+    constructor(address _dexRouter) EnhancedDynoTokenV3(_dexRouter) {
+        // Initialize treasury metrics
+        treasuryMetrics.lastRebalance = block.timestamp;
+    }
+
+    // Treasury Management Functions
+    function addTreasuryAsset(address token, uint256 initialBalance) external onlyOwner {
+        require(!treasuryAssets[token].isActive, "Asset already added");
+        
+        treasuryAssets[token] = TreasuryAsset({
+            token: token,
+            balance: initialBalance,
+            allocated: 0,
+            lastRebalance: block.timestamp,
+            isActive: true
+        });
+        
+        emit TreasuryAssetAdded(token, initialBalance);
+    }
+
+    function addYieldStrategy(
+        address strategy,
+        uint256 targetPercentage,
+        uint256 minAPY
+    ) external onlyOwner {
+        require(IYieldStrategy(strategy).getAPY() >= minAPY, "APY too low");
+        
+        yieldStrategies[strategy] = YieldStrategy({
+            strategy: strategy,
+            allocatedAmount: 0,
+            targetPercentage: targetPercentage,
+            minAPY: minAPY,
+            isActive: true
+        });
+        
+        emit YieldStrategyUpdated(strategy, targetPercentage);
+    }
+
+    function rebalanceTreasury() external nonReentrant {
+        require(
+            block.timestamp >= treasuryMetrics.lastRebalance + TREASURY_REBALANCE_INTERVAL,
+            "Too soon to rebalance"
+        );
+
+        uint256 totalValue = 0;
+        uint256 totalYield = 0;
+
+        // Calculate total value and collect yields
+        for (address strategy in getActiveStrategies()) {
+            YieldStrategy storage yStrat = yieldStrategies[strategy];
+            if (yStrat.isActive) {
+                IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
+                
+                uint256 currentValue = yieldStrategy.getTotalValue();
+                uint256 yield = currentValue - yStrat.allocatedAmount;
+                
+                totalValue += currentValue;
+                totalYield += yield;
+                
+                // Withdraw if APY drops below minimum
+                if (yieldStrategy.getAPY() < yStrat.minAPY) {
+                    yieldStrategy.withdraw(currentValue);
+                    yStrat.allocatedAmount = 0;
+                }
+            }
+        }
+
+        // Rebalance allocations
+        for (address strategy in getActiveStrategies()) {
+            YieldStrategy storage yStrat = yieldStrategies[strategy];
+            if (yStrat.isActive) {
+                uint256 targetAmount = (totalValue * yStrat.targetPercentage) / 100;
+                uint256 currentAmount = yStrat.allocatedAmount;
+                
+                if (targetAmount > currentAmount) {
+                    uint256 toDeposit = targetAmount - currentAmount;
+                    IYieldStrategy(strategy).deposit(toDeposit);
+                    yStrat.allocatedAmount += toDeposit;
+                } else if (targetAmount < currentAmount) {
+                    uint256 toWithdraw = currentAmount - targetAmount;
+                    IYieldStrategy(strategy).withdraw(toWithdraw);
+                    yStrat.allocatedAmount -= toWithdraw;
+                }
+            }
+        }
+
+        // Update metrics
+        treasuryMetrics.totalValue = totalValue;
+        treasuryMetrics.yieldGenerated += totalYield;
+        treasuryMetrics.lastRebalance = block.timestamp;
+        treasuryMetrics.performanceScore = calculatePerformanceScore();
+
+        emit TreasuryRebalanced(totalValue, block.timestamp);
+    }
+
+    // Cross-chain Functions
+    function addSupportedChain(
+        uint256 chainId,
+        address bridgeAdapter,
+        address remoteToken
+    ) external onlyOwner {
+        require(!supportedChains[chainId].isActive, "Chain already supported");
+        
+        supportedChains[chainId] = ChainInfo({
+            chainId: chainId,
+            bridgeAdapter: bridgeAdapter,
+            remoteToken: remoteToken,
+            isActive: true
+        });
+    }
+
+    function bridgeTokens(
+        uint256 targetChain,
+        address recipient,
+        uint256 amount
+    ) external nonReentrant {
+        require(amount >= MIN_BRIDGE_AMOUNT, "Amount too low");
+        require(supportedChains[targetChain].isActive, "Chain not supported");
+        require(
+            block.timestamp >= lastTransactionTime[msg.sender] + BRIDGE_COOL_DOWN,
+            "Bridge cooldown active"
+        );
+
+        // Generate unique transaction hash
+        bytes32 txHash = keccak256(
+            abi.encodePacked(
+                block.timestamp,
+                msg.sender,
+                recipient,
+                amount,
+                bridgeTransactionCount++
+            )
+        );
+
+        // Store bridge transaction
+        bridgeTransactions[txHash] = BridgeTransaction({
+            sourceChain: block.chainid,
+            targetChain: targetChain,
+            sender: msg.sender,
+            recipient: recipient,
+            amount: amount,
+            timestamp: block.timestamp,
+            isProcessed: false
+        });
+
+        // Transfer tokens to bridge adapter
+        ChainInfo storage targetChainInfo = supportedChains[targetChain];
+        _transfer(msg.sender, targetChainInfo.bridgeAdapter, amount);
+
+        // Initiate bridge transaction
+        IBridgeAdapter(targetChainInfo.bridgeAdapter).bridgeTokens(
+            address(this),
+            amount,
+            targetChain,
+            recipient
+        );
+
+        emit BridgeTransactionInitiated(txHash, block.chainid, targetChain);
+    }
+
+    function receiveBridgedTokens(
+        uint256 sourceChain,
+        address recipient,
+        uint256 amount,
+        bytes calldata proof
+    ) external {
+        require(supportedChains[sourceChain].isActive, "Source chain not supported");
+        require(
+            msg.sender == supportedChains[sourceChain].bridgeAdapter,
+            "Invalid bridge adapter"
+        );
+
+        // Verify and process bridge transaction
+        bytes32 txHash = keccak256(abi.encodePacked(sourceChain, recipient, amount, proof));
+        require(!bridgeTransactions[txHash].isProcessed, "Transaction already processed");
+
+        // Mint tokens to recipient
+        _mint(recipient, amount);
+        bridgeTransactions[txHash].isProcessed = true;
+
+        emit BridgeTransactionCompleted(txHash, recipient, amount);
+    }
+
+    // Helper Functions
+    function getActiveStrategies() internal view returns (address[] memory) {
+        // Implementation to return array of active strategy addresses
+        // This is a placeholder - actual implementation would track active strategies
+        return new address[](0);
+    }
+
+    function calculatePerformanceScore() internal view returns (uint256) {
+        // Implementation to calculate treasury performance score
+        // This is a placeholder - actual implementation would use various metrics
+        return 0;
+    }
+
+    // Treasury View Functions
+    function getTreasuryOverview() external view returns (
+        uint256 totalValue,
+        uint256 totalYield,
+        uint256 performanceScore,
+        uint256 numberOfStrategies
+    ) {
+        return (
+            treasuryMetrics.totalValue,
+            treasuryMetrics.yieldGenerated,
+            treasuryMetrics.performanceScore,
+            getActiveStrategies().length
+        );
+    }
+
+    function getStrategyDetails(address strategy) external view returns (
+        uint256 currentValue,
+        uint256 apy,
+        uint256 allocated,
+        uint256 targetPercentage
+    ) {
+        YieldStrategy storage yStrat = yieldStrategies[strategy];
+        require(yStrat.isActive, "Strategy not active");
+
+        IYieldStrategy yieldStrategy = IYieldStrategy(strategy);
+        return (
+            yieldStrategy.getTotalValue(),
+            yieldStrategy.getAPY(),
+            yStrat.allocatedAmount,
+            yStrat.targetPercentage
+        );
+    }
+}

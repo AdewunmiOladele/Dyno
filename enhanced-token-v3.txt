@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
+import "@openzeppelin/contracts/governance/Governor.sol";
+import "@openzeppelin/contracts/governance/extensions/GovernorSettings.sol";
+import "@openzeppelin/contracts/governance/extensions/GovernorCountingSimple.sol";
+import "@openzeppelin/contracts/governance/extensions/GovernorVotes.sol";
+import "@openzeppelin/contracts/governance/extensions/GovernorVotesQuorumFraction.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+
+// Previous imports remain the same...
+
+contract EnhancedDynoTokenV3 is ERC20Votes, Ownable, ReentrancyGuard, Pausable, ERC20Burnable {
+    // Previous contract state variables and structs remain...
+
+    // Anti-Bot Structures
+    struct TradingLimits {
+        uint256 maxBuyAmount;
+        uint256 maxSellAmount;
+        uint256 maxWalletSize;
+        uint256 gasPriceLimit;
+        uint256 blockDelay;
+        bool antiMEV;
+    }
+
+    struct AntiBot {
+        uint256 buyCount;
+        uint256 sellCount;
+        uint256 totalBuyAmount;
+        uint256 totalSellAmount;
+        uint256 firstTrade;
+        uint256 lastTrade;
+        bool flagged;
+    }
+
+    // Governance Structures
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        string description;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 forVotes;
+        uint256 againstVotes;
+        bool executed;
+        mapping(address => bool) hasVoted;
+    }
+
+    struct GovernanceSettings {
+        uint256 proposalThreshold;    // Min tokens needed to submit proposal
+        uint256 votingPeriod;         // Duration of voting in blocks
+        uint256 votingDelay;          // Blocks before voting starts
+        uint256 quorumPercent;        // Required participation percentage
+    }
+
+    // State Variables for New Features
+    TradingLimits public tradingLimits;
+    mapping(address => AntiBot) public tradingPattern;
+    mapping(address => uint256) public lastGasPrice;
+    
+    GovernanceSettings public govSettings;
+    mapping(uint256 => Proposal) public proposals;
+    uint256 public proposalCount;
+    
+    // Events
+    event ProposalCreated(uint256 indexed proposalId, address proposer, string description);
+    event Voted(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
+    event ProposalExecuted(uint256 indexed proposalId);
+    event BotFlagged(address indexed account, string reason);
+    event TradingLimitsUpdated(uint256 maxBuy, uint256 maxSell, uint256 maxWallet);
+
+    constructor(address _dexRouter) 
+        ERC20("Enhanced Dyno V3", "EDYN3") 
+        ERC20Permit("Enhanced Dyno V3")
+        Ownable(msg.sender) 
+    {
+        // Initialize trading limits
+        tradingLimits = TradingLimits({
+            maxBuyAmount: MAX_SUPPLY / 100,     // 1% of total supply
+            maxSellAmount: MAX_SUPPLY / 200,    // 0.5% of total supply
+            maxWalletSize: MAX_SUPPLY / 50,     // 2% of total supply
+            gasPriceLimit: 50 gwei,
+            blockDelay: 5,                      // Blocks delay after launch
+            antiMEV: true
+        });
+
+        // Initialize governance settings
+        govSettings = GovernanceSettings({
+            proposalThreshold: 100000 * 10**18, // 100,000 tokens
+            votingPeriod: 45818,               // ~1 week (assuming 13s block time)
+            votingDelay: 6545,                 // ~1 day
+            quorumPercent: 4                   // 4% participation required
+        });
+    }
+
+    // Governance Functions
+    function createProposal(string calldata description) external returns (uint256) {
+        require(getVotes(msg.sender) >= govSettings.proposalThreshold, "Insufficient voting power");
+        
+        uint256 proposalId = ++proposalCount;
+        Proposal storage newProposal = proposals[proposalId];
+        
+        newProposal.id = proposalId;
+        newProposal.proposer = msg.sender;
+        newProposal.description = description;
+        newProposal.startTime = block.timestamp + govSettings.votingDelay;
+        newProposal.endTime = newProposal.startTime + govSettings.votingPeriod;
+        
+        emit ProposalCreated(proposalId, msg.sender, description);
+        return proposalId;
+    }
+
+    function castVote(uint256 proposalId, bool support) external {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp >= proposal.startTime, "Voting not started");
+        require(block.timestamp <= proposal.endTime, "Voting ended");
+        require(!proposal.hasVoted[msg.sender], "Already voted");
+        
+        uint256 votes = getVotes(msg.sender);
+        require(votes > 0, "No voting power");
+        
+        proposal.hasVoted[msg.sender] = true;
+        if (support) {
+            proposal.forVotes += votes;
+        } else {
+            proposal.againstVotes += votes;
+        }
+        
+        emit Voted(proposalId, msg.sender, support, votes);
+    }
+
+    function executeProposal(uint256 proposalId) external {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp > proposal.endTime, "Voting not ended");
+        require(!proposal.executed, "Already executed");
+        
+        uint256 totalVotes = proposal.forVotes + proposal.againstVotes;
+        require(totalVotes >= (totalSupply() * govSettings.quorumPercent) / 100, "Quorum not reached");
+        require(proposal.forVotes > proposal.againstVotes, "Proposal rejected");
+        
+        proposal.executed = true;
+        emit ProposalExecuted(proposalId);
+        
+        // Execute proposal logic here
+        _executeProposal(proposalId);
+    }
+
+    // Anti-Bot Functions
+    function _checkAndUpdateTradingPattern(
+        address account,
+        uint256 amount,
+        bool isBuy
+    ) internal {
+        AntiBot storage pattern = tradingPattern[account];
+        
+        // First trade initialization
+        if (pattern.firstTrade == 0) {
+            pattern.firstTrade = block.timestamp;
+        }
+        
+        // Update trading pattern
+        if (isBuy) {
+            pattern.buyCount++;
+            pattern.totalBuyAmount += amount;
+            require(pattern.totalBuyAmount <= tradingLimits.maxBuyAmount, "Buy limit exceeded");
+        } else {
+            pattern.sellCount++;
+            pattern.totalSellAmount += amount;
+            require(pattern.totalSellAmount <= tradingLimits.maxSellAmount, "Sell limit exceeded");
+        }
+        
+        // Check for suspicious patterns
+        _detectSuspiciousActivity(account, pattern);
+        
+        pattern.lastTrade = block.timestamp;
+    }
+
+    function _detectSuspiciousActivity(address account, AntiBot storage pattern) internal {
+        // Rapid trading detection
+        if (pattern.lastTrade > 0 && 
+            block.timestamp - pattern.lastTrade < 3 minutes &&
+            pattern.buyCount + pattern.sellCount > 5) {
+            _flagBot(account, "Rapid trading detected");
+        }
+        
+        // Large trade variance detection
+        if (pattern.buyCount > 0 && pattern.sellCount > 0) {
+            uint256 avgBuy = pattern.totalBuyAmount / pattern.buyCount;
+            uint256 avgSell = pattern.totalSellAmount / pattern.sellCount;
+            if (Math.max(avgBuy, avgSell) > Math.min(avgBuy, avgSell) * 5) {
+                _flagBot(account, "Suspicious trade variance");
+            }
+        }
+        
+        // Contract interaction check
+        uint256 codeSize;
+        assembly {
+            codeSize := extcodesize(account)
+        }
+        if (codeSize > 0 && !whitelisted[account]) {
+            _flagBot(account, "Contract interaction");
+        }
+    }
+
+    function _flagBot(address account, string memory reason) internal {
+        if (!tradingPattern[account].flagged) {
+            tradingPattern[account].flagged = true;
+            emit BotFlagged(account, reason);
+        }
+    }
+
+    // Enhanced Transfer Override
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual override {
+        require(!tradingPattern[sender].flagged, "Sender flagged as bot");
+        require(!tradingPattern[recipient].flagged, "Recipient flagged as bot");
+        
+        // MEV Protection
+        if (tradingLimits.antiMEV) {
+            require(tx.gasprice <= tradingLimits.gasPriceLimit, "Gas price too high");
+        }
+        
+        // Trading pattern analysis
+        bool isBuy = recipient == address(this) || recipient == address(dexRouter);
+        _checkAndUpdateTradingPattern(sender, amount, isBuy);
+        
+        // Previous transfer logic...
+        super._transfer(sender, recipient, amount);
+    }
+
+    // Governance Helper Functions
+    function _executeProposal(uint256 proposalId) internal {
+        // Implementation of proposal execution based on proposal type
+        // This would be expanded based on the types of proposals supported
+    }
+
+    function getProposalVotes(uint256 proposalId) external view returns (
+        uint256 forVotes,
+        uint256 againstVotes,
+        uint256 totalVotes,
+        bool executed
+    ) {
+        Proposal storage proposal = proposals[proposalId];
+        return (
+            proposal.forVotes,
+            proposal.againstVotes,
+            proposal.forVotes + proposal.againstVotes,
+            proposal.executed
+        );
+    }
+
+    // Admin Functions
+    function updateTradingLimits(
+        uint256 _maxBuy,
+        uint256 _maxSell,
+        uint256 _maxWallet,
+        uint256 _gasPriceLimit
+    ) external onlyOwner {
+        tradingLimits.maxBuyAmount = _maxBuy;
+        tradingLimits.maxSellAmount = _maxSell;
+        tradingLimits.maxWalletSize = _maxWallet;
+        tradingLimits.gasPriceLimit = _gasPriceLimit;
+        
+        emit TradingLimitsUpdated(_maxBuy, _maxSell, _maxWallet);
+    }
+
+    function updateGovernanceSettings(
+        uint256 _proposalThreshold,
+        uint256 _votingPeriod,
+        uint256 _votingDelay,
+        uint256 _quorumPercent
+    ) external onlyOwner {
+        govSettings.proposalThreshold = _proposalThreshold;
+        govSettings.votingPeriod = _votingPeriod;
+        govSettings.votingDelay = _votingDelay;
+        govSettings.quorumPercent = _quorumPercent;
+    }
+}

@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/finance/VestingWallet.sol";
+
+interface IDEXRouter {
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+    
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+interface IDEXPair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+contract EnhancedDynoTokenV2 is ERC20, Ownable, ReentrancyGuard, Pausable, ERC20Burnable {
+    // Previous contract constants and variables...
+    uint96 public immutable MAX_SUPPLY = 50_000_000 * 10**18;
+    uint8 public immutable MAX_FEE = 10;
+    uint8 public constant DENOMINATOR = 100;
+    
+    // New structs for enhanced features
+    struct DynamicFees {
+        uint8 baseFee;
+        uint8 volumeMultiplier;
+        uint8 priceImpactMultiplier;
+        uint8 timeSinceLastTradeFactor;
+        uint256 lastFeeUpdate;
+        uint256 updateInterval;
+    }
+
+    struct StakingInfo {
+        uint256 amount;
+        uint256 startTime;
+        uint256 lastRewardClaim;
+        uint256 rewardDebt;
+        uint8 tier;
+        bool locked;
+    }
+
+    struct EnhancedAnalytics {
+        uint256 volumeLastHour;
+        uint256 volumeLastDay;
+        uint256 volumeLastWeek;
+        uint256 averageTransactionSize;
+        uint256 uniqueHolders;
+        uint256 priceImpactAverage;
+        uint256 lastUpdateBlock;
+    }
+
+    // New state variables
+    DynamicFees public dynamicFees;
+    EnhancedAnalytics public enhancedAnalytics;
+    mapping(address => StakingInfo) public stakingInfo;
+    mapping(uint8 => uint256) public stakingTierRewards;
+    uint256[] public stakingTierThresholds;
+    
+    // Trading volume tracking
+    mapping(uint256 => uint256) public hourlyVolume;
+    mapping(uint256 => uint256) public dailyVolume;
+    mapping(uint256 => uint256) public weeklyVolume;
+
+    // Events
+    event Staked(address indexed user, uint256 amount, uint8 tier);
+    event UnStaked(address indexed user, uint256 amount);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    event DynamicFeeUpdated(uint8 newFee, uint256 timestamp);
+    event AnalyticsUpdated(uint256 volume24h, uint256 averageTransaction);
+
+    constructor(address _dexRouter) ERC20("Enhanced Dyno V2", "EDYN2") Ownable(msg.sender) {
+        // Initialize dynamic fees
+        dynamicFees = DynamicFees({
+            baseFee: 3,
+            volumeMultiplier: 1,
+            priceImpactMultiplier: 1,
+            timeSinceLastTradeFactor: 1,
+            lastFeeUpdate: block.timestamp,
+            updateInterval: 1 hours
+        });
+
+        // Initialize staking tiers
+        stakingTierThresholds = [
+            1000 * 10**18,  // Tier 1: 1,000 tokens
+            5000 * 10**18,  // Tier 2: 5,000 tokens
+            10000 * 10**18  // Tier 3: 10,000 tokens
+        ];
+
+        stakingTierRewards[1] = 5;  // 5% APR
+        stakingTierRewards[2] = 10; // 10% APR
+        stakingTierRewards[3] = 15; // 15% APR
+    }
+
+    // Staking functions
+    function stake(uint256 amount, bool locked) external nonReentrant whenNotPaused {
+        require(amount > 0, "Cannot stake 0");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+
+        // Transfer tokens to contract
+        _transfer(msg.sender, address(this), amount);
+
+        // Determine staking tier
+        uint8 tier = _calculateStakingTier(amount);
+
+        // Update or create staking info
+        StakingInfo storage userStaking = stakingInfo[msg.sender];
+        
+        if (userStaking.amount > 0) {
+            // Claim any pending rewards before adding more stake
+            _claimRewards(msg.sender);
+        }
+
+        userStaking.amount += amount;
+        userStaking.startTime = block.timestamp;
+        userStaking.lastRewardClaim = block.timestamp;
+        userStaking.tier = tier;
+        userStaking.locked = locked;
+
+        emit Staked(msg.sender, amount, tier);
+    }
+
+    function unstake(uint256 amount) external nonReentrant {
+        StakingInfo storage userStaking = stakingInfo[msg.sender];
+        require(userStaking.amount >= amount, "Insufficient staked amount");
+        require(!userStaking.locked || block.timestamp >= userStaking.startTime + 30 days, "Locked stake period not ended");
+
+        // Claim rewards before unstaking
+        _claimRewards(msg.sender);
+
+        // Update staking info
+        userStaking.amount -= amount;
+        userStaking.tier = _calculateStakingTier(userStaking.amount);
+
+        // Transfer tokens back to user
+        _transfer(address(this), msg.sender, amount);
+
+        emit UnStaked(msg.sender, amount);
+    }
+
+    function claimRewards() external nonReentrant {
+        _claimRewards(msg.sender);
+    }
+
+    // Dynamic fee calculation
+    function calculateDynamicFee(address sender, uint256 amount) public view returns (uint8) {
+        uint8 fee = dynamicFees.baseFee;
+        
+        // Volume-based adjustment
+        uint256 currentHourVolume = hourlyVolume[block.timestamp / 1 hours];
+        if (currentHourVolume > 1000 * 10**18) { // If volume > 1000 tokens
+            fee += dynamicFees.volumeMultiplier;
+        }
+
+        // Price impact adjustment
+        uint256 priceImpact = _calculatePriceImpact(amount);
+        if (priceImpact > 3) { // If price impact > 3%
+            fee += dynamicFees.priceImpactMultiplier;
+        }
+
+        // Time since last trade
+        uint256 timeSinceLastTrade = block.timestamp - lastTransactionTime[sender];
+        if (timeSinceLastTrade < 5 minutes) {
+            fee += dynamicFees.timeSinceLastTradeFactor;
+        }
+
+        return fee > MAX_FEE ? MAX_FEE : fee;
+    }
+
+    // Internal helper functions
+    function _calculateStakingTier(uint256 amount) internal view returns (uint8) {
+        for (uint8 i = 0; i < stakingTierThresholds.length; i++) {
+            if (amount >= stakingTierThresholds[i]) {
+                return i + 1;
+            }
+        }
+        return 0;
+    }
+
+    function _claimRewards(address user) internal {
+        StakingInfo storage userStaking = stakingInfo[user];
+        require(userStaking.amount > 0, "No staked tokens");
+
+        uint256 timeElapsed = block.timestamp - userStaking.lastRewardClaim;
+        uint256 reward = (userStaking.amount * stakingTierRewards[userStaking.tier] * timeElapsed) / (365 days * 100);
+
+        if (reward > 0) {
+            userStaking.lastRewardClaim = block.timestamp;
+            _mint(user, reward);
+            emit RewardsClaimed(user, reward);
+        }
+    }
+
+    function _calculatePriceImpact(uint256 amount) internal view returns (uint256) {
+        // Implement price impact calculation using DEX pair reserves
+        return 0; // Placeholder
+    }
+
+    // Analytics update function
+    function _updateAnalytics(uint256 amount) internal {
+        uint256 currentHour = block.timestamp / 1 hours;
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 currentWeek = block.timestamp / 1 weeks;
+
+        hourlyVolume[currentHour] += amount;
+        dailyVolume[currentDay] += amount;
+        weeklyVolume[currentWeek] += amount;
+
+        enhancedAnalytics.volumeLastHour = hourlyVolume[currentHour];
+        enhancedAnalytics.volumeLastDay = dailyVolume[currentDay];
+        enhancedAnalytics.volumeLastWeek = weeklyVolume[currentWeek];
+        enhancedAnalytics.averageTransactionSize = (enhancedAnalytics.averageTransactionSize + amount) / 2;
+        enhancedAnalytics.lastUpdateBlock = block.number;
+
+        emit AnalyticsUpdated(enhancedAnalytics.volumeLastDay, enhancedAnalytics.averageTransactionSize);
+    }
+
+    // Override _transfer to include new features
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual override {
+        // Previous transfer checks...
+
+        // Calculate and apply dynamic fee
+        uint8 dynamicFee = calculateDynamicFee(sender, amount);
+        uint256 feeAmount = (amount * dynamicFee) / DENOMINATOR;
+        uint256 transferAmount = amount - feeAmount;
+
+        // Execute transfer
+        super._transfer(sender, address(this), feeAmount);
+        super._transfer(sender, recipient, transferAmount);
+
+        // Update analytics
+        _updateAnalytics(amount);
+
+        // Update last transaction time
+        lastTransactionTime[sender] = block.timestamp;
+    }
+}
